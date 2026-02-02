@@ -1,242 +1,677 @@
 #ifndef UNI_ESP_STORAGES_H
 #define UNI_ESP_STORAGES_H
 
-#include <Arduino.h>
-#include <Preferences.h>
-#include <LittleFS.h>
-#include <nvs_flash.h> // Требуется для полной очистки NVS
 
-// --- КОНФИГУРАЦИЯ БИБЛИОТЕКИ ---
-#define STORAGE_DEBUG_ENABLE  // Раскомментируйте для включения логов в Serial
-#define STORAGE_CHECK_OTA     // Проверка статуса OTA перед записью
-
-#ifdef STORAGE_DEBUG_ENABLE
-    // Логгирование: [аптайм в мс][STORAGE] сообщение
-    #define ST_LOG(x, ...) Serial.printf("[%lu][STORAGE] " x "\n", millis(), ##__VA_ARGS__)
+//если нужно сохранять только мелкие данные - то файловую систему можно отключить
+#ifndef STORAGE_DISABLE_LITTLEFS
+#define STORAGE_USE_LITTLEFS 1
 #else
-    #define ST_LOG(x, ...)
+#define STORAGE_USE_LITTLEFS 0
 #endif
 
-// Прототип функции CRC32 из ROM памяти ESP32
+#include <Arduino.h>
+#include <Preferences.h>
+#if STORAGE_USE_LITTLEFS
+    #include <LittleFS.h>
+#endif
+#include <nvs_flash.h>
+
+// --- КОНФИГУРАЦИЯ БИБЛИОТЕКИ ---
+#define STORAGE_LOG_NONE    0
+#define STORAGE_LOG_ERROR   1
+#define STORAGE_LOG_WARNING 2
+#define STORAGE_LOG_INFO    3
+#define STORAGE_LOG_DEBUG   4
+
+#ifndef STORAGE_LOG_LEVEL
+#define STORAGE_LOG_LEVEL STORAGE_LOG_INFO
+#endif
+
+#define STORAGE_DEBUG_ENABLE
+#define STORAGE_CHECK_OTA
+#define NVS_MAX_SIZE 3000
+
+#ifdef STORAGE_DEBUG_ENABLE
+    #define ST_LOG(level, x, ...) \
+        if (level <= STORAGE_LOG_LEVEL) \
+            Serial.printf("[%lu][STORAGE][%s] " x "\n", millis(), \
+                         level == 1 ? "ERROR" : level == 2 ? "WARN" : \
+                         level == 3 ? "INFO" : "DEBUG", ##__VA_ARGS__)
+#else
+    #define ST_LOG(level, x, ...)
+#endif
+
 extern "C" uint32_t crc32_le(uint32_t crc, unsigned char const *p, size_t len);
 
 /**
- * КЛАСС ДЛЯ РАБОТЫ С NVS (Энергонезависимое хранилище мелких настроек)
- * Подходит для Wi-Fi паролей, флагов состояния и т.д.
+ * @class StorageSmallAkaNVS
+ * @brief Класс для работы с энергонезависимой памятью (NVS)
  */
 class StorageSmallAkaNVS {
 private:
     const char* _ns;
     Preferences _prefs;
-
-    // Структура-обертка для хранения данных вместе с контрольной суммой
+    uint32_t _minSaveInterval = 1000;
+    uint32_t _lastSaveTime = 0;
+    
+    #pragma pack(push, 1)
     template <typename T>
-    struct __attribute__((packed)) Package {
+    struct Package {
+        uint8_t version;
+        uint8_t reserved[3];
         uint32_t crc;
         T data;
     };
+    #pragma pack(pop)
 
 public:
-    // Конструктор: принимает имя пространства имен (max 15 символов)
+    /**
+     * Конструктор
+     * @param namespaceName Имя пространства имен NVS (max 15 символов)
+     */
     StorageSmallAkaNVS(const char* namespaceName) : _ns(namespaceName) {}
 
     /**
      * Загрузка данных из NVS
      * @param key Уникальное имя ключа
      * @param data Ссылка на переменную/структуру
-     * @param resetFunc Функция, заполняющая дефолты при ошибке
+     * @param expectedVersion Ожидаемая версия данных
+     * @param resetFunc Функция сброса к значениям по умолчанию
+     * @return true если данные загружены успешно
      */
     template <typename T>
-    bool load(const char* key, T& data, void (*resetFunc)(T&) = nullptr) {
-        ST_LOG("NVS: Load '%s'...", key);
-        if (!_prefs.begin(_ns, true)) return false;
+    bool load(const char* key, T& data, uint8_t expectedVersion = 1, 
+              void (*resetFunc)(T&) = nullptr) {
+        ST_LOG(STORAGE_LOG_INFO, "NVS: Load '%s'...", key);
+        
+        if (!_prefs.begin(_ns, true)) {
+            ST_LOG(STORAGE_LOG_ERROR, "NVS: Failed to open namespace '%s'", _ns);
+            return false;
+        }
         
         Package<T> pkg;
         size_t len = _prefs.getBytes(key, &pkg, sizeof(pkg));
         _prefs.end();
 
-        uint32_t calcCrc = crc32_le(0, (const uint8_t*)&pkg.data, sizeof(T));
-        
-        // Если размер не совпал или CRC битый — сброс
-        if (len != sizeof(pkg) || pkg.crc != calcCrc) {
-            ST_LOG("NVS: Integrity fail. Resetting...");
+        if (len != sizeof(pkg)) {
+            ST_LOG(STORAGE_LOG_WARNING, "NVS: Size mismatch for '%s' (got %u, expected %u)", 
+                   key, len, sizeof(pkg));
             if (resetFunc) resetFunc(data);
-            save(key, data);
+            save(key, data, expectedVersion);
+            return false;
+        }
+
+        if (pkg.version != expectedVersion) {
+            ST_LOG(STORAGE_LOG_WARNING, "NVS: Version mismatch for '%s' (stored: %d, expected: %d)", 
+                   key, pkg.version, expectedVersion);
+            if (resetFunc) resetFunc(data);
+            save(key, data, expectedVersion);
+            return false;
+        }
+
+        uint32_t calcCrc = crc32_le(0, (const uint8_t*)&pkg.data, sizeof(T));
+        if (pkg.crc != calcCrc) {
+            ST_LOG(STORAGE_LOG_ERROR, "NVS: CRC error for '%s' (stored: 0x%08X, calc: 0x%08X)", 
+                   key, pkg.crc, calcCrc);
+            if (resetFunc) resetFunc(data);
+            save(key, data, expectedVersion);
             return false;
         }
         
         data = pkg.data;
-        ST_LOG("NVS: '%s' loaded OK", key);
+        ST_LOG(STORAGE_LOG_INFO, "NVS: '%s' loaded OK (version: %d, size: %u)", 
+               key, pkg.version, sizeof(pkg));
         return true;
     }
 
-    // Сохранение данных в NVS
-    template <typename T>
-    void save(const char* key, const T& data) {
-        Package<T> pkg;
-        pkg.data = data;
-        pkg.crc = crc32_le(0, (const uint8_t*)&data, sizeof(T));
-        
-        if (_prefs.begin(_ns, false)) {
-            _prefs.putBytes(key, &pkg, sizeof(pkg));
-            _prefs.end();
-            ST_LOG("NVS: '%s' saved", key);
-        }
-    }
-};
-
-/**
- * ОБЪЕКТ ДЛЯ РАБОТЫ С ФАЙЛАМИ В LittleFS
- * Поддерживает Debounce (задержку записи) и проверку CRC
- */
-template <typename T>
-class StorageBigAkaFileSys {
-private:
-    const char* _path;        // Путь к файлу (напр. "/config.bin")
-    T& _data;                 // Ссылка на структуру данных
-    uint32_t _intervalMs;     // Интервал выдержки в мс
-    uint32_t _lastChangeTime = 0; // Время последнего вызова update()
-    bool _isDirty = false;    // Флаг наличия несохраненных изменений
-    
-    inline static bool _otaRunning = false; // Общий флаг блокировки записи для всех файлов
-
-    // Проверка наличия свободного места (размер данных + CRC + 512 байт запаса)
-    bool hasSpace() {
-        size_t free = LittleFS.totalBytes() - LittleFS.usedBytes();
-        size_t needed = sizeof(T) + 4 + 512; 
-        if (free < needed) {
-            ST_LOG("FS ERR: Low space! Free: %u, Need: %u", free, needed);
-            return false;
-        }
-        return true;
-    }
-
-public:
     /**
-     * Конструктор файлового объекта
-     * @param path Путь к файлу
-     * @param data Ссылка на структуру данных
-     * @param intervalSec Время выдержки перед записью в СЕКУНДАХ
+     * Сохранение данных в NVS
+     * @param key Уникальное имя ключа
+     * @param data Данные для сохранения
+     * @param version Версия структуры данных
+     * @param force Игнорировать защиту от частых записей
+     * @return true если данные сохранены успешно
      */
-    StorageBigAkaFileSys(const char* path, T& data, uint32_t intervalSec) 
-        : _path(path), _data(data), _intervalMs(intervalSec * 1000) {}
-
-    // Установить статус работы OTA (блокирует запись во flash)
-    static void setOtaRunning(bool state) { _otaRunning = state; }
-
-    // Загрузка из файла с проверкой целостности
-    bool load(void (*resetFunc)(T&) = nullptr) {
-        ST_LOG("FS: Read '%s'...", _path);
-        File f = LittleFS.open(_path, "r");
-        if (!f) {
-            ST_LOG("FS: Not found '%s'. Reset...", _path);
-            if (resetFunc) resetFunc(_data);
-            save();
+    template <typename T>
+    bool save(const char* key, const T& data, uint8_t version = 1, bool force = false) {
+        if (sizeof(Package<T>) > NVS_MAX_SIZE) {
+            ST_LOG(STORAGE_LOG_ERROR, "NVS: Data too large for '%s'! Max %u bytes, got %u", 
+                   key, NVS_MAX_SIZE, sizeof(Package<T>));
             return false;
         }
-
-        uint32_t storedCrc;
-        bool ok = (f.read((uint8_t*)&storedCrc, 4) == 4) && 
-                  (f.read((uint8_t*)&_data, sizeof(T)) == sizeof(T));
-        f.close();
-
-        if (!ok || crc32_le(0, (const uint8_t*)&_data, sizeof(T)) != storedCrc) {
-            ST_LOG("FS: CRC error in '%s'. Reset...", _path);
-            if (resetFunc) resetFunc(_data);
-            save();
-            return false;
-        }
-        ST_LOG("FS: '%s' loaded OK", _path);
-        return true;
-    }
-
-    // Непосредственная запись файла
-    void save() {
-#ifdef STORAGE_CHECK_OTA
-        if (_otaRunning) {
-            ST_LOG("FS: Blocked by OTA!");
-            return;
-        }
-#endif
-        if (!hasSpace()) return;
-
-        File f = LittleFS.open(_path, "w");
-        if (!f) {
-            ST_LOG("FS ERR: Can't write '%s'", _path);
-            return;
-        }
         
-        uint32_t crc = crc32_le(0, (const uint8_t*)&_data, sizeof(T));
-        f.write((uint8_t*)&crc, 4);
-        f.write((uint8_t*)&_data, sizeof(T));
-        f.close();
-        
-        _isDirty = false;
-        ST_LOG("FS: '%s' saved (CRC: 0x%08X)", _path, crc);
-    }
-
-    // Пометить данные как измененные и обновить таймер отложенной записи
-    void update() {
-        _isDirty = true;
-        _lastChangeTime = millis();
-    }
-
-    // Проверка таймера (вызывать в loop)
-    void tick() {
-        if (_isDirty && (millis() - _lastChangeTime >= _intervalMs)) {
-            ST_LOG("FS: Debounce timeout reached for '%s'. Saving...", _path);
-            save();
-        }
-    }
-
-    // Принудительное сохранение (если были изменения)
-    void flush() {
-        if (_isDirty) save();
-    }
-};
-
-/**
- * СЕРВИСНЫЙ КЛАСС ДЛЯ УПРАВЛЕНИЯ ФАЙЛОВОЙ СИСТЕМОЙ
- */
-class StorageFS {
-public:
-    // Инициализация LittleFS с автоматическим форматированием при ошибке
-    static bool begin() {
-        if (!LittleFS.begin(false)) {
-            ST_LOG("FS: Mount failed. Trying to format...");
-            if (!LittleFS.begin(true)) {
-                ST_LOG("FS CRITICAL: Format failed!");
+        if (!force) {
+            uint32_t now = millis();
+            uint32_t elapsed = (now >= _lastSaveTime) 
+                ? (now - _lastSaveTime) 
+                : (UINT32_MAX - _lastSaveTime + now);
+                
+            if (elapsed < _minSaveInterval) {
+                ST_LOG(STORAGE_LOG_WARNING, "NVS: Save throttled for '%s' (elapsed: %u ms)", 
+                       key, elapsed);
                 return false;
             }
-            ST_LOG("FS: Format successful.");
-        } else {
-            ST_LOG("FS: Mount OK.");
+            _lastSaveTime = now;
         }
+        
+        Package<T> pkg;
+        pkg.version = version;
+        pkg.crc = crc32_le(0, (const uint8_t*)&data, sizeof(T));
+        pkg.data = data;
+        
+        if (!_prefs.begin(_ns, false)) {
+            ST_LOG(STORAGE_LOG_ERROR, "NVS: Failed to open namespace '%s' for write", _ns);
+            return false;
+        }
+        
+        size_t written = _prefs.putBytes(key, &pkg, sizeof(pkg));
+        _prefs.end();
+        
+        if (written != sizeof(pkg)) {
+            ST_LOG(STORAGE_LOG_ERROR, "NVS: Failed to write key '%s' (written: %u, expected: %u)", 
+                   key, written, sizeof(pkg));
+            return false;
+        }
+        
+        ST_LOG(STORAGE_LOG_INFO, "NVS: '%s' saved (version: %d, size: %u, CRC: 0x%08X)", 
+               key, version, sizeof(pkg), pkg.crc);
         return true;
     }
 
-    // Полная очистка всего устройства (LittleFS + все разделы NVS)
-    static void fullReset() {
-        ST_LOG("!!! FULL RESET STARTED !!!");
-        
-        // Форматирование LittleFS
-        if (LittleFS.format()) {
-            ST_LOG("FS: LittleFS formatted OK.");
-        } else {
-            ST_LOG("FS ERR: LittleFS format failed.");
-        }
+    /**
+     * Проверка наличия ключа
+     * @param key Имя ключа
+     * @return true если ключ существует
+     */
+    bool exists(const char* key) {
+        if (!_prefs.begin(_ns, true)) return false;
+        bool keyExists = _prefs.isKey(key);
+        _prefs.end();
+        ST_LOG(STORAGE_LOG_DEBUG, "NVS: Key '%s' exists: %s", key, keyExists ? "yes" : "no");
+        return keyExists;
+    }
 
-        // Полное стирание NVS Flash через системную функцию
-        esp_err_t err = nvs_flash_erase();
-        if (err == ESP_OK) {
-            ST_LOG("NVS: All partitions erased OK.");
-            nvs_flash_init(); // Переинициализация для возможности работы без перезагрузки
+    /**
+     * Удаление ключа
+     * @param key Имя ключа
+     * @return true если ключ удалён успешно
+     */
+    bool remove(const char* key) {
+        if (!_prefs.begin(_ns, false)) return false;
+        bool success = _prefs.remove(key);
+        _prefs.end();
+        if (success) {
+            ST_LOG(STORAGE_LOG_INFO, "NVS: Key '%s' removed", key);
         } else {
-            ST_LOG("NVS ERR: Erase failed code: 0x%X", err);
+            ST_LOG(STORAGE_LOG_ERROR, "NVS: Key '%s' remove failed", key);
         }
+        return success;
+    }
 
-        ST_LOG("!!! RESET DONE. REBOOT RECOMMENDED !!!");
+    /**
+     * Установить минимальный интервал между записями
+     * @param ms Интервал в миллисекундах
+     */
+    void setMinSaveInterval(uint32_t ms) {
+        _minSaveInterval = ms;
+        ST_LOG(STORAGE_LOG_DEBUG, "NVS: Min save interval set to %u ms", ms);
     }
 };
 
+
+
+#if STORAGE_USE_LITTLEFS
+    /**
+     * @class StorageBigAkaFileSys
+     * @brief Класс для работы с файлами в LittleFS
+     * @tparam T Тип хранимых данных
+     */
+    template <typename T>
+    class StorageBigAkaFileSys {
+    private:
+        const char* _path;
+        T& _data;
+        uint32_t _intervalMs;
+        uint32_t _lastChangeTime = 0;
+        bool _isDirty = false;
+        bool _fsMounted = false;
+        bool _debounceEnabled = true;
+        
+        // inline static работает с C++17
+        inline static bool _otaRunning = false;
+
+        /**
+         * Проверка наличия свободного места
+         * @return true если достаточно места для записи
+         */
+        bool hasSpace() {
+            size_t free = LittleFS.totalBytes() - LittleFS.usedBytes();
+            size_t needed = sizeof(T) + 4 + 512;
+            if (free < needed) {
+                ST_LOG(STORAGE_LOG_ERROR, "FS: Low space for '%s'! Free: %u, Need: %u", 
+                    _path, free, needed);
+                return false;
+            }
+            return true;
+        }
+
+    public:
+        /**
+         * Конструктор файлового объекта
+         * @param path Путь к файлу
+         * @param data Ссылка на структуру данных
+         * @param intervalSec Время выдержки перед записью в секундах
+         * @param debounceEnabled Включить отложенную запись
+         */
+        StorageBigAkaFileSys(const char* path, T& data, uint32_t intervalSec = 5, 
+                            bool debounceEnabled = true) 
+            : _path(path), _data(data), _intervalMs(intervalSec * 1000), 
+            _debounceEnabled(debounceEnabled) {
+            _fsMounted = LittleFS.begin(false);
+            if (!_fsMounted) {
+                ST_LOG(STORAGE_LOG_WARNING, "FS: Filesystem not mounted for '%s'", _path);
+            }
+        }
+
+        /**
+         * Установить статус работы OTA
+         * @param state true если выполняется OTA обновление
+         */
+        static void setOtaRunning(bool state) { 
+            _otaRunning = state;
+            ST_LOG(STORAGE_LOG_INFO, "FS: OTA running state set to %s", state ? "true" : "false");
+        }
+
+        /**
+         * Получить статус OTA
+         * @return true если выполняется OTA обновление
+         */
+        static bool isOtaRunning() { 
+            return _otaRunning;
+        }
+
+        /**
+         * Загрузка из файла с проверкой целостности
+         * @param resetFunc Функция для сброса данных при ошибке
+         * @return true если данные загружены успешно
+         */
+        bool load(void (*resetFunc)(T&) = nullptr) {
+            if (!_fsMounted) {
+                ST_LOG(STORAGE_LOG_ERROR, "FS: Filesystem not mounted for '%s'", _path);
+                return false;
+            }
+            
+            ST_LOG(STORAGE_LOG_INFO, "FS: Read '%s'...", _path);
+            File f = LittleFS.open(_path, "r");
+            if (!f) {
+                ST_LOG(STORAGE_LOG_WARNING, "FS: File '%s' not found", _path);
+                if (resetFunc) resetFunc(_data);
+                save();
+                return false;
+            }
+
+            uint32_t storedCrc;
+            bool ok = (f.read((uint8_t*)&storedCrc, 4) == 4) && 
+                    (f.read((uint8_t*)&_data, sizeof(T)) == sizeof(T));
+            f.close();
+
+            if (!ok) {
+                ST_LOG(STORAGE_LOG_ERROR, "FS: Read error from '%s'", _path);
+                if (resetFunc) resetFunc(_data);
+                save();
+                return false;
+            }
+
+            uint32_t calcCrc = crc32_le(0, (const uint8_t*)&_data, sizeof(T));
+            if (calcCrc != storedCrc) {
+                ST_LOG(STORAGE_LOG_ERROR, "FS: CRC error in '%s' (stored: 0x%08X, calc: 0x%08X)", 
+                    _path, storedCrc, calcCrc);
+                if (resetFunc) resetFunc(_data);
+                save();
+                return false;
+            }
+            
+            ST_LOG(STORAGE_LOG_INFO, "FS: '%s' loaded OK (size: %u, CRC: 0x%08X)", 
+                _path, sizeof(T), calcCrc);
+            return true;
+        }
+
+        /**
+         * Непосредственная запись файла
+         * @return true если файл записан успешно
+         */
+        bool save() {
+    #ifdef STORAGE_CHECK_OTA
+            if (_otaRunning) {
+                ST_LOG(STORAGE_LOG_WARNING, "FS: Blocked by OTA for '%s'", _path);
+                return false;
+            }
+    #endif
+            if (!_fsMounted) {
+                ST_LOG(STORAGE_LOG_ERROR, "FS: Filesystem not mounted for '%s'", _path);
+                return false;
+            }
+            
+            if (!hasSpace()) {
+                return false;
+            }
+
+            File f = LittleFS.open(_path, "w");
+            if (!f) {
+                ST_LOG(STORAGE_LOG_ERROR, "FS: Can't write '%s'", _path);
+                return false;
+            }
+            
+            uint32_t crc = crc32_le(0, (const uint8_t*)&_data, sizeof(T));
+            size_t writtenCrc = f.write((uint8_t*)&crc, 4);
+            size_t writtenData = f.write((uint8_t*)&_data, sizeof(T));
+            f.close();
+            
+            if (writtenCrc != 4 || writtenData != sizeof(T)) {
+                ST_LOG(STORAGE_LOG_ERROR, "FS: Write error for '%s'", _path);
+                return false;
+            }
+            
+            _isDirty = false;
+            ST_LOG(STORAGE_LOG_INFO, "FS: '%s' saved (size: %u, CRC: 0x%08X)", 
+                _path, sizeof(T), crc);
+            return true;
+        }
+
+        /**
+         * Пометить данные как измененные
+         */
+        void update() {
+            _isDirty = true;
+            _lastChangeTime = millis();
+            
+            if (!_debounceEnabled) {
+                save();
+            }
+        }
+
+        /**
+         * Проверка таймера отложенной записи
+         */
+        void tick() {
+            if (!_debounceEnabled || !_isDirty) return;
+            
+            uint32_t currentTime = millis();
+            uint32_t elapsed = (currentTime >= _lastChangeTime) 
+                ? (currentTime - _lastChangeTime) 
+                : (UINT32_MAX - _lastChangeTime + currentTime);
+            
+            if (elapsed >= _intervalMs) {
+                ST_LOG(STORAGE_LOG_DEBUG, "FS: Debounce timeout for '%s' (elapsed: %u ms)", 
+                    _path, elapsed);
+                save();
+            }
+        }
+
+        /**
+         * Принудительное сохранение
+         * @return true если данные сохранены
+         */
+        bool flush() {
+            if (_isDirty) {
+                return save();
+            }
+            return true;
+        }
+
+        /**
+         * Проверка существования файла
+         * @return true если файл существует
+         */
+        bool exists() {
+            if (!_fsMounted) return false;
+            return LittleFS.exists(_path);
+        }
+
+        /**
+         * Удаление файла
+         * @return true если файл удалён
+         */
+        bool remove() {
+            if (!_fsMounted) return false;
+            bool success = LittleFS.remove(_path);
+            if (success) {
+                _isDirty = false;
+                ST_LOG(STORAGE_LOG_INFO, "FS: File '%s' removed", _path);
+            } else {
+                ST_LOG(STORAGE_LOG_ERROR, "FS: Failed to remove '%s'", _path);
+            }
+            return success;
+        }
+
+        /**
+         * Включить/отключить отложенную запись
+         * @param enabled true для включения дебаунса
+         */
+        void setDebounceEnabled(bool enabled) {
+            _debounceEnabled = enabled;
+            ST_LOG(STORAGE_LOG_DEBUG, "FS: Debounce for '%s' %s", 
+                _path, enabled ? "enabled" : "disabled");
+        }
+
+        /**
+         * Получить статус изменений
+         * @return true если есть несохраненные изменения
+         */
+        bool isDirty() const {
+            return _isDirty;
+        }
+
+        /**
+         * Получить путь к файлу
+         * @return Путь к файлу
+         */
+        const char* getPath() const {
+            return _path;
+        }
+
+        /**
+         * Получить интервал дебаунса
+         * @return Интервал в миллисекундах
+         */
+        uint32_t getDebounceInterval() const {
+            return _intervalMs;
+        }
+    };
+
+    /**
+     * @struct StorageStats
+     * @brief Статистика использования файловой системы
+     */
+    struct StorageStats {
+        size_t totalBytes;
+        size_t usedBytes;
+        size_t freeBytes;
+        float usedPercent;
+    };
+
+    /**
+     * @class StorageFS
+     * @brief Сервисный класс для управления файловой системой
+     */
+    class StorageFS {
+    public:
+        /**
+         * Инициализация LittleFS
+         * @param formatOnFail Форматировать при ошибке монтирования
+         * @return true если файловая система инициализирована
+         */
+        static bool begin(bool formatOnFail = true) {
+            ST_LOG(STORAGE_LOG_INFO, "FS: Mounting...");
+            
+            if (!LittleFS.begin(false)) {
+                if (!formatOnFail) {
+                    ST_LOG(STORAGE_LOG_ERROR, "FS: Mount failed");
+                    return false;
+                }
+                
+                ST_LOG(STORAGE_LOG_WARNING, "FS: Mount failed. Trying to format...");
+                if (!LittleFS.begin(true)) {
+                    ST_LOG(STORAGE_LOG_ERROR, "FS: Format failed!");
+                    return false;
+                }
+                ST_LOG(STORAGE_LOG_INFO, "FS: Format successful.");
+            } else {
+                ST_LOG(STORAGE_LOG_INFO, "FS: Mount OK.");
+            }
+            
+            printStats();
+            return true;
+        }
+
+        /**
+         * Получить статистику использования
+         * @return Структура со статистикой
+         */
+        static StorageStats getStats() {
+            StorageStats stats;
+            stats.totalBytes = LittleFS.totalBytes();
+            stats.usedBytes = LittleFS.usedBytes();
+            stats.freeBytes = (stats.totalBytes > stats.usedBytes) 
+                ? (stats.totalBytes - stats.usedBytes) 
+                : 0;
+            stats.usedPercent = (stats.totalBytes > 0) 
+                ? (100.0f * stats.usedBytes / stats.totalBytes) 
+                : 0.0f;
+            return stats;
+        }
+
+        /**
+         * Вывод статистики в лог
+         */
+        static void printStats() {
+            StorageStats stats = getStats();
+            ST_LOG(STORAGE_LOG_INFO, 
+                "FS Stats: Total: %u bytes, Used: %u bytes (%.1f%%), Free: %u bytes",
+                stats.totalBytes, stats.usedBytes, stats.usedPercent, stats.freeBytes);
+        }
+
+        /**
+         * Полная очистка всех хранилищ
+         * @warning Удаляет все данные! Требует перезагрузки!
+         */
+        static void fullReset() {
+            ST_LOG(STORAGE_LOG_WARNING, "!!! FULL RESET STARTED !!!");
+            
+            if (LittleFS.format()) {
+                ST_LOG(STORAGE_LOG_INFO, "FS: LittleFS formatted OK.");
+            } else {
+                ST_LOG(STORAGE_LOG_ERROR, "FS: LittleFS format failed.");
+            }
+
+            esp_err_t err = nvs_flash_erase();
+            if (err == ESP_OK) {
+                ST_LOG(STORAGE_LOG_INFO, "NVS: All partitions erased OK.");
+                nvs_flash_init();
+            } else {
+                ST_LOG(STORAGE_LOG_ERROR, "NVS: Erase failed code: 0x%X", err);
+            }
+
+            ST_LOG(STORAGE_LOG_WARNING, "!!! RESET COMPLETE. REBOOT REQUIRED !!!");
+        }
+
+        /**
+         * Создание резервной копии файла
+         * @param srcPath Исходный файл
+         * @param backupPath Файл для резервной копии (если nullptr, будет создан с .bak)
+         * @return true если резервная копия создана
+         */
+        static bool backupFile(const char* srcPath, const char* backupPath = nullptr) {
+            if (!backupPath) {
+                backupPath = (String(srcPath) + ".bak").c_str();
+            }
+            
+            if (LittleFS.exists(backupPath)) {
+                LittleFS.remove(backupPath);
+            }
+            
+            File src = LittleFS.open(srcPath, "r");
+            if (!src) {
+                ST_LOG(STORAGE_LOG_ERROR, "FS: Can't open source file '%s'", srcPath);
+                return false;
+            }
+            
+            File dst = LittleFS.open(backupPath, "w");
+            if (!dst) {
+                src.close();
+                ST_LOG(STORAGE_LOG_ERROR, "FS: Can't create backup file '%s'", backupPath);
+                return false;
+            }
+            
+            uint8_t buffer[512];
+            size_t total = 0;
+            while (src.available()) {
+                size_t len = src.read(buffer, sizeof(buffer));
+                dst.write(buffer, len);
+                total += len;
+            }
+            
+            src.close();
+            dst.close();
+            
+            ST_LOG(STORAGE_LOG_INFO, "FS: Backup created '%s' -> '%s' (%u bytes)", 
+                srcPath, backupPath, total);
+            return true;
+        }
+
+        /**
+         * Получение списка файлов в директории
+         * @param path Путь к директории (по умолчанию корень)
+         * @return Вектор с именами файлов
+         */
+        static std::vector<String> listFiles(const char* path = "/") {
+            std::vector<String> files;
+            File root = LittleFS.open(path);
+            
+            if (!root || !root.isDirectory()) {
+                ST_LOG(STORAGE_LOG_ERROR, "FS: Can't open directory '%s'", path);
+                return files;
+            }
+            
+            File file = root.openNextFile();
+            while (file) {
+                files.push_back(String(file.name()));
+                file = root.openNextFile();
+            }
+            
+            root.close();
+            return files;
+        }
+
+        /**
+         * Получение информации о файле
+         * @param path Путь к файлу
+         * @return Размер файла в байтах, или 0 если файл не существует
+         */
+        static size_t getFileSize(const char* path) {
+            File f = LittleFS.open(path, "r");
+            if (!f) return 0;
+            size_t size = f.size();
+            f.close();
+            return size;
+        }
+
+        /**
+         * Получение свободного места
+         * @return Свободное место в байтах
+         */
+        static size_t getFreeSpace() {
+            return LittleFS.totalBytes() - LittleFS.usedBytes();
+        }
+
+        /**
+         * Проверка существования файла
+         * @param path Путь к файлу
+         * @return true если файл существует
+         */
+        static bool fileExists(const char* path) {
+            return LittleFS.exists(path);
+        }
+    };
+#endif //юз биг дата
 #endif
