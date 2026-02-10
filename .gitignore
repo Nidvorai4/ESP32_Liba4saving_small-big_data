@@ -1,0 +1,6 @@
+.pio
+.vscode/
+platformio.ini
+*.db
+*.txt
+~*

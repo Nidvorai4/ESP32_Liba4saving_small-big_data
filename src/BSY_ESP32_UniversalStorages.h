@@ -1,18 +1,18 @@
-#ifndef UNI_ESP_STORAGES_H
-#define UNI_ESP_STORAGES_H
-
+#ifndef BSY_ESP32_UNIVERSALSTORAGES_H
+#define BSY_ESP32_UNIVERSALSTORAGES_H
 
 //если нужно сохранять только мелкие данные - то файловую систему можно отключить
-#ifndef STORAGE_DISABLE_LITTLEFS
-#define STORAGE_USE_LITTLEFS 1
+#ifndef BSY_STORAGE_DISABLE_LITTLEFS
+#define BSY_STORAGE_USE_LITTLEFS 1
 #else
-#define STORAGE_USE_LITTLEFS 0
+#define BSY_STORAGE_USE_LITTLEFS 0
 #endif
 
 #include <Arduino.h>
 #include <Preferences.h>
-#if STORAGE_USE_LITTLEFS
+#if BSY_STORAGE_USE_LITTLEFS
     #include <LittleFS.h>
+    #include <vector>
 #endif
 #include <nvs_flash.h>
 
@@ -71,17 +71,15 @@ public:
      */
     StorageSmallAkaNVS(const char* namespaceName) : _ns(namespaceName) {}
 
-    /**
-     * Загрузка данных из NVS
+       /**
+     * Загрузка данных из NVS (без функции сброса)
      * @param key Уникальное имя ключа
      * @param data Ссылка на переменную/структуру
      * @param expectedVersion Ожидаемая версия данных
-     * @param resetFunc Функция сброса к значениям по умолчанию
-     * @return true если данные загружены успешно
+     * @return true если данные загружены успешно и валидны
      */
     template <typename T>
-    bool load(const char* key, T& data, uint8_t expectedVersion = 1, 
-              void (*resetFunc)(T&) = nullptr) {
+    bool load(const char* key, T& data, uint8_t expectedVersion = 1) {
         ST_LOG(STORAGE_LOG_INFO, "NVS: Load '%s'...", key);
         
         if (!_prefs.begin(_ns, true)) {
@@ -93,36 +91,32 @@ public:
         size_t len = _prefs.getBytes(key, &pkg, sizeof(pkg));
         _prefs.end();
 
+        // 1. Проверка размера
         if (len != sizeof(pkg)) {
-            ST_LOG(STORAGE_LOG_WARNING, "NVS: Size mismatch for '%s' (got %u, expected %u)", 
-                   key, len, sizeof(pkg));
-            if (resetFunc) resetFunc(data);
-            save(key, data, expectedVersion);
+            ST_LOG(STORAGE_LOG_WARNING, "NVS: Size mismatch or key '%s' not found", key);
             return false;
         }
 
+        // 2. Проверка версии
         if (pkg.version != expectedVersion) {
             ST_LOG(STORAGE_LOG_WARNING, "NVS: Version mismatch for '%s' (stored: %d, expected: %d)", 
                    key, pkg.version, expectedVersion);
-            if (resetFunc) resetFunc(data);
-            save(key, data, expectedVersion);
             return false;
         }
 
+        // 3. Проверка целостности (CRC)
         uint32_t calcCrc = crc32_le(0, (const uint8_t*)&pkg.data, sizeof(T));
         if (pkg.crc != calcCrc) {
-            ST_LOG(STORAGE_LOG_ERROR, "NVS: CRC error for '%s' (stored: 0x%08X, calc: 0x%08X)", 
-                   key, pkg.crc, calcCrc);
-            if (resetFunc) resetFunc(data);
-            save(key, data, expectedVersion);
+            ST_LOG(STORAGE_LOG_ERROR, "NVS: CRC error for '%s'", key);
             return false;
         }
         
+        // Если все проверки пройдены, копируем данные
         data = pkg.data;
-        ST_LOG(STORAGE_LOG_INFO, "NVS: '%s' loaded OK (version: %d, size: %u)", 
-               key, pkg.version, sizeof(pkg));
+        ST_LOG(STORAGE_LOG_INFO, "NVS: '%s' loaded OK (version: %d)", key, pkg.version);
         return true;
     }
+
 
     /**
      * Сохранение данных в NVS
@@ -220,7 +214,7 @@ public:
 
 
 
-#if STORAGE_USE_LITTLEFS
+#if BSY_STORAGE_USE_LITTLEFS
     /**
      * @class StorageBigAkaFileSys
      * @brief Класс для работы с файлами в LittleFS

@@ -1,0 +1,7 @@
+{
+  "name": "BSY_ESP32_UniversalStorages",
+  "version": "1.0.0",
+  "description": "Краткое описание вашей либы",
+  "frameworks": "arduino",
+  "platforms": "*"
+}
