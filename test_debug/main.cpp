@@ -14,7 +14,7 @@ struct STest {
 }sTest;
 
 StorageSmallAkaNVS nvsTest("npspcTest");
-
+StorageSmallAkaNVS nvsTestNoNamespace("NoNameSpace");
 struct BigData {
     char dummy[2990]; 
 };
@@ -46,6 +46,16 @@ void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 5000); 
     delay(2000);
+    
+
+    Serial.println("\n тест загрузки отсутствующего неймспейса и ключа");
+    int hui=0;
+    bool resNoNamespc =nvsTestNoNamespace.load("hui",hui,1);
+    Serial.printf("Load unknown key from no namespace: %s\n", resNoNamespc==false ? "OK" : "---------------------FAIL");
+    delay(1100);
+
+
+
 
     Serial.println("\n--- ЭТАП 1: СОХРАНЕНИЕ ---");
 
