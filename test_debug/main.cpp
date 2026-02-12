@@ -15,6 +15,32 @@ struct STest {
 
 StorageSmallAkaNVS nvsTest("npspcTest");
 
+struct BigData {
+    char dummy[2990]; 
+};
+
+
+/// @brief проверка на стэковерфлоу (версия либы 1.1.0) падала при попытке загрузки списка 50 датчиков
+void testStackCrash() {
+    BigData bigTest;
+    memset(bigTest.dummy, 'A', sizeof(bigTest.dummy)); // Заполним мусором
+
+    Serial.println(">>> Starting CRASH TEST (Save Big Data)...");
+    
+    // Этот вызов должен привести к Guru Meditation Error или перезагрузке,
+    // если в Storage::save() всё еще написано Package<T> pkg;
+    bool resBig = nvsTest.save("big_data", bigTest, 1);
+    
+    Serial.printf("Save big: %s\n", resBig ? "OK" : "---------------------FAIL");
+
+    BigData bigRead;
+    if (nvsTest.load("big_data", bigRead, 1)) {
+        Serial.println("Load big: OK");
+    } else {
+        Serial.println("Load big: FAILED");
+    }
+}
+
 void setup() {
     delay(1000);
     Serial.begin(115200);
@@ -25,22 +51,22 @@ void setup() {
 
     // 1. Сохраняем bool (ключ "bool")
     bool resBool = nvsTest.save("bool", bTest,1);
-    Serial.printf("Save bool: %s\n", resBool ? "OK" : "FAIL");
+    Serial.printf("Save bool: %s\n", resBool ? "OK" : "---------------------FAIL");
     delay(1100);
 
     // 2. Сохраняем int (ключ "int")
     bool resInt = nvsTest.save("int", iTest,1);
-    Serial.printf("Save int: %s\n", resInt ? "OK" : "FAIL");
+    Serial.printf("Save int: %s\n", resInt ? "OK" : "---------------------FAIL");
     delay(1100);
 
     // 3. Сохраняем float (ключ "float")
     bool resFloat = nvsTest.save("float", fTest,1);
-    Serial.printf("Save float: %s\n", resFloat ? "OK" : "FAIL");
+    Serial.printf("Save float: %s\n", resFloat ? "OK" : "---------------------FAIL");
     delay(1100);
 
     // 4. Сохраняем структуру (ключ "struct", форсированно)
     bool resStruct = nvsTest.save("struct", sTest, 1, true); 
-    Serial.printf("Save struct: %s\n", resStruct ? "OK" : "FAIL");
+    Serial.printf("Save struct: %s\n", resStruct ? "OK" : "---------------------FAIL");
 
     Serial.println("\n--- ЭТАП 2: ПРОВЕРКА (ЗАГРУЗКА) ---");
 
@@ -48,7 +74,7 @@ void setup() {
     bool bRead = false;
     if (nvsTest.load("bool", bRead,1)) {
         Serial.printf("Load bool OK: %s (Match: %s)\n", 
-                      bRead ? "true" : "false", (bRead == bTest ? "YES" : "NO"));
+                      bRead ? "true" : "false", (bRead == bTest ? "YES" : "------------------------NO"));
     } else {
         Serial.println("Load bool: FAILED");
     }
@@ -57,7 +83,7 @@ void setup() {
     int iRead = 0;
     if (nvsTest.load("int", iRead,1)) {
         Serial.printf("Load int OK: %d (Match: %s)\n", 
-                      iRead, (iRead == iTest ? "YES" : "NO"));
+                      iRead, (iRead == iTest ? "YES" : "------------------------NO"));
     } else {
         Serial.println("Load int: FAILED");
     }
@@ -66,7 +92,7 @@ void setup() {
     float fRead = 0.0;
     if (nvsTest.load("float", fRead,1)) {
         Serial.printf("Load float OK: %.2f (Match: %s)\n", 
-                      fRead, (fRead == fTest ? "YES" : "NO"));
+                      fRead, (fRead == fTest ? "YES" : "------------------------NO"));
     } else {
         Serial.println("Load float: FAILED");
     }
@@ -80,15 +106,18 @@ void setup() {
         
         Serial.printf("Load struct OK! Data: i=%d, f=%.2f, s=%s\n", 
                       sRead.iTest, sRead.fTest, sRead.chTest);
-        Serial.printf("Struct Match: %s\n", structMatch ? "YES" : "NO");
+        Serial.printf("Struct Match: %s\n", structMatch ? "YES" : "------------------------NO");
     } else {
         Serial.println("Load struct: FAILED");
     }
 
+    testStackCrash();
+
     Serial.println("\n--- ТЕСТ ЗАВЕРШЕН ---");
 
 
-    nvsTest.clearNamespace();
+    nvsTest.fullResetNVS();
+
 }
 
 void loop(){

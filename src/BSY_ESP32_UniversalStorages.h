@@ -1,7 +1,7 @@
 #ifndef BSY_ESP32_UNIVERSALSTORAGES_H
 #define BSY_ESP32_UNIVERSALSTORAGES_H
 
-#define BASAY_UNIVERSALSTORAGES_VERSION "v1.1.0"
+#define BASAY_UNIVERSALSTORAGES_VERSION "v1.1.1"
 
 //если нужно сохранять только мелкие данные - то файловую систему можно отключить 
 /* 

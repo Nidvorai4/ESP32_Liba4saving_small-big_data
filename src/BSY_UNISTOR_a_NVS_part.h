@@ -1,7 +1,7 @@
 #ifndef BSY_UNISTOR_A_NVS_PART_H
 #define BSY_UNISTOR_A_NVS_PART_H
 #include <Preferences.h>
-
+#include <memory>
 //#include "BSY_ESP32_UniversalStorages.h" //чтоб система не ругалась на отсутствие определения ST_LOG
 
 /**
@@ -48,33 +48,53 @@ public:
             return false;
         }
         
-        Package<T> pkg;
-        size_t len = _prefs.getBytes(key, &pkg, sizeof(pkg));
+        
+        //Package<T>* pkg = new (std::nothrow) Package<T>(); // <--- ИСПРАВЛЕНО
+        // Создаем умный указатель в куче. Память очистится сама при любом return.
+        std::unique_ptr<Package<T>> pkg(new (std::nothrow) Package<T>()); 
+
+        if (!pkg) { // <--- ДОБАВЛЕНО (проверка на нехватку оперативной памяти)
+            ST_LOG(STORAGE_LOG_ERROR, "NVS: Out of memory for '%s'", key);
+            _prefs.end();
+            return false;
+        }
+
+
+
+        //size_t len = _prefs.getBytes(key, &pkg, sizeof(pkg));
+        //size_t len = _prefs.getBytes(key, pkg, sizeof(Package<T>));
+        // Читаем данные напрямую в выделенную область памяти
+        size_t len = _prefs.getBytes(key, pkg.get(), sizeof(Package<T>));
+
         _prefs.end();
 
         // 1. Проверка размера
-        if (len != sizeof(pkg)) {
+        if (len != sizeof(Package<T>)) {
             ST_LOG(STORAGE_LOG_WARNING, "NVS: Size mismatch or key '%s' not found", key);
+            //delete pkg;
             return false;
         }
 
         // 2. Проверка версии
-        if (pkg.version != expectedVersion) {
+        if (pkg->version != expectedVersion) {
             ST_LOG(STORAGE_LOG_WARNING, "NVS: Version mismatch for '%s' (stored: %d, expected: %d)", 
-                   key, pkg.version, expectedVersion);
+                   key, pkg->version, expectedVersion);
+            //delete pkg;
             return false;
         }
 
         // 3. Проверка целостности (CRC)
-        uint32_t calcCrc = crc32_le(0, (const uint8_t*)&pkg.data, sizeof(T));
-        if (pkg.crc != calcCrc) {
+        uint32_t calcCrc = crc32_le(0, (const uint8_t*)&pkg->data, sizeof(T));
+        if (pkg->crc != calcCrc) {
             ST_LOG(STORAGE_LOG_ERROR, "NVS: CRC error for '%s'", key);
+            //delete pkg;
             return false;
         }
         
         // Если все проверки пройдены, копируем данные
-        memcpy(&data, &pkg.data, sizeof(T)); 
-        ST_LOG(STORAGE_LOG_INFO, "NVS: '%s' loaded OK (version: %d)", key, pkg.version);
+        memcpy(&data, &pkg->data, sizeof(T)); 
+        ST_LOG(STORAGE_LOG_INFO, "NVS: '%s' loaded OK (version: %d)", key, pkg->version);
+        //delete pkg;
         return true;
     }
 
@@ -91,7 +111,7 @@ public:
     bool save(const char* key, const T& data, uint8_t version , bool force = false) {
         if (sizeof(Package<T>) > NVS_MAX_SIZE) {
             ST_LOG(STORAGE_LOG_ERROR, "NVS: Data too large for '%s'! Max %u bytes, got %u", 
-                   key, NVS_MAX_SIZE, sizeof(Package<T>));
+                   key, NVS_MAX_SIZE, (uint32_t)sizeof(Package<T>));
             return false;
         }
         
@@ -109,27 +129,35 @@ public:
             _lastSaveTime = now;
         }
         
-        Package<T> pkg;
-        pkg.version = version;
-        pkg.crc = crc32_le(0, (const uint8_t*)&data, sizeof(T));
-        memcpy(&pkg.data, &data, sizeof(T));
+        //Package<T> pkg;
+        std::unique_ptr<Package<T>> pkg(new (std::nothrow) Package<T>()); 
+
+        if (!pkg) { // Проверка на случай, если оперативная память совсем кончилась
+            ST_LOG(STORAGE_LOG_ERROR, "NVS: Out of memory for '%s' save", key);
+            return false;
+        }
+
+        pkg->version = version;
+        pkg->crc = crc32_le(0, (const uint8_t*)&data, sizeof(T));
+        memcpy(&pkg->data, &data, sizeof(T));
         
         if (!_prefs.begin(_ns, false)) {
             ST_LOG(STORAGE_LOG_ERROR, "NVS: Failed to open namespace '%s' for write", _ns);
             return false;
         }
         
-        size_t written = _prefs.putBytes(key, &pkg, sizeof(pkg));
+        //size_t written = _prefs.putBytes(key, &pkg, sizeof(pkg));
+        size_t written = _prefs.putBytes(key, pkg.get(), sizeof(Package<T>));
         _prefs.end();
         
-        if (written != sizeof(pkg)) {
+        if (written != sizeof(Package<T>)) {
             ST_LOG(STORAGE_LOG_ERROR, "NVS: Failed to write key '%s' (written: %u, expected: %u)", 
-                   key, written, sizeof(pkg));
+                   key, written, (uint32_t)sizeof(Package<T>));
             return false;
         }
         
         ST_LOG(STORAGE_LOG_INFO, "NVS: '%s' saved (version: %d, size: %u, CRC: 0x%08X)", 
-               key, version, sizeof(pkg), pkg.crc);
+               key, version, (uint32_t)sizeof(Package<T>), pkg->crc);
         return true;
     }
 
